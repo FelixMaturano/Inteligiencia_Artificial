@@ -32,17 +32,14 @@ class MoELayer(nn.Module):
         )
         # Router (Capa lineal de proyección)
         self.router = nn.Linear(d_model, num_experts)
+
     def forward(self, x: torch.Tensor):
-        # ---------------------------------------------------------
         # 0. Aplanado de entrada: [batch, seq_len, d_model] -> [n_tokens, d_model]
-        # ---------------------------------------------------------
         orig_shape = x.shape
         x_flat = x.reshape(-1, orig_shape[-1])
         n_tokens = x_flat.shape[0]
 
-        # ---------------------------------------------------------
         # 1. ROUTER & TOP-K SELECTION
-        # ---------------------------------------------------------
         router_logits = self.router(x_flat)
         router_probs = F.softmax(router_logits, dim=-1)
 
@@ -51,9 +48,7 @@ class MoELayer(nn.Module):
         # Renormalización probabilística de los top-k seleccionados
         topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-9)
 
-        # ---------------------------------------------------------
         # 2. PROCESAMIENTO DISPERSO CONDICIONAL
-        # ---------------------------------------------------------
         output_flat = torch.zeros_like(x_flat)
 
         for expert_id, expert in enumerate(self.experts):
@@ -79,9 +74,7 @@ class MoELayer(nn.Module):
         # Restaurar forma original del tensor
         output = output_flat.reshape(orig_shape)
 
-        # ---------------------------------------------------------
         # 3. LOAD BALANCING LOSS (SWITCH TRANSFORMER)
-        # ---------------------------------------------------------
         top1_idx = topk_idx[:, 0]
         tokens_per_expert = torch.zeros(self.num_experts, device=x.device, dtype=x.dtype)
         tokens_per_expert.scatter_add_(
@@ -144,7 +137,6 @@ def ejecutar_prueba():
     print(f" Tiempo promedio: {tiempo_ms:.3f} ms")
     if device.type == "cuda":
         print(f"VRAM máxima asignada: {memoria_mb:.2f} MB")
-
 
 if __name__ == "__main__":
     ejecutar_prueba()
