@@ -1,111 +1,142 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+class Expert(nn.Module):
 
-
-class SparseDispatcher(object):
-    def __init__(self, num_experts, gates):
-        self._gates = gates
-        self._num_experts = num_experts
-
-        assignments = torch.nonzero(gates > 0, as_tuple=False)
-        self._batch_index = assignments[:, 0]
-        self._expert_index = assignments[:, 1]
-        self._part_sizes = (gates > 0).sum(dim=0).int().tolist()
-        self._nonzero_gates = gates[self._batch_index, self._expert_index]
-
-    def dispatch(self, inp):
-        inp_exp = inp[self._batch_index]
-        return list(torch.split(inp_exp, self._part_sizes, dim=0))
-
-    def combine(self, expert_out, multiply_by_gates=True):
-        stitched = torch.cat(expert_out, dim=0)
-        if multiply_by_gates:
-            stitched = stitched * self._nonzero_gates.view(-1, 1)
-
-        zeros = torch.zeros(
-            self._gates.size(0),
-            stitched.size(1),
-            device=stitched.device,
-            dtype=stitched.dtype,
-        )
-        combined = zeros.index_add(0, self._batch_index, stitched)
-        return combined
-
-    def expert_to_gates(self):
-        return list(torch.split(self._nonzero_gates, self._part_sizes, dim=0))
-
-
-class MLP(nn.Module):
-    def __init__(self, input_size, output_size, hidden_size):
-        super(MLP, self).__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, output_size)
-        self.relu = nn.ReLU()
+    def __init__(self, dim, hidden):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim))
 
     def forward(self, x):
-        out = self.fc1(x)
-        out = self.relu(out)
-        out = self.fc2(out)
-        return out
+        return self.net(x)
+
+
+class NoisyTopKRouter(nn.Module):
+
+    def __init__(self, dim, num_experts, k=2, noisy=True):
+        super().__init__()
+        assert k <= num_experts
+        self.k, self.num_experts, self.noisy = k, num_experts, noisy
+        self.w_gate = nn.Linear(dim, num_experts, bias=False)
+        self.w_noise = nn.Linear(dim, num_experts)
+        # Inicio pequeño -> al comienzo el reparto es casi uniforme (no hay expertos "ganadores")
+        nn.init.normal_(self.w_gate.weight, std=0.02)
+        nn.init.zeros_(self.w_noise.weight)
+        nn.init.constant_(self.w_noise.bias, -2.0)  # softplus(-2) ~ 0.13 de ruido inicial
+
+    def forward(self, x):
+        clean_logits = self.w_gate(x)                                  # [N, E]
+        logits = clean_logits
+        if self.noisy and self.training:
+            std = F.softplus(self.w_noise(x)) + 1e-2
+            logits = clean_logits + torch.randn_like(clean_logits) * std
+
+        top_logits, top_idx = logits.topk(self.k, dim=-1)              # [N, k]
+        top_gates = F.softmax(top_logits, dim=-1)                      # [N, k]
+
+        # --- Pérdida auxiliar de balanceo (estilo Switch Transformer) ---
+        # f_i = fracción de asignaciones que recibe el experto i   (no diferenciable)
+        # P_i = probabilidad media que el router le da al experto i (diferenciable)
+        # aux = E * sum(f_i * P_i)  ->  vale 1.0 cuando el reparto es perfectamente uniforme
+        probs = F.softmax(clean_logits, dim=-1)
+        P = probs.mean(dim=0)
+        f = F.one_hot(top_idx, self.num_experts).sum(dim=1).float().mean(dim=0) / self.k
+        aux_loss = self.num_experts * (f * P).sum()
+        return top_idx, top_gates, aux_loss
 
 
 class MoE(nn.Module):
-    def __init__(self, input_size, output_size, hidden_size, num_experts, noisy_gating=True, k=4):
-        super(MoE, self).__init__()
-        self.noisy_gating = noisy_gating
-        self.num_experts = num_experts
-        self.output_size = output_size
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.k = k
 
-        self.experts = nn.ModuleList([
-            MLP(self.input_size, self.output_size, self.hidden_size) for _ in range(self.num_experts)
-        ])
+    def __init__(self, dim, hidden, num_experts=8, k=2, noisy=True):
+        super().__init__()
+        self.router = NoisyTopKRouter(dim, num_experts, k, noisy)
+        self.experts = nn.ModuleList([Expert(dim, hidden) for _ in range(num_experts)])
+        self.last_top_idx = None  # se guarda para analizar el enrutamiento después
 
-        self.w_gate = nn.Parameter(torch.zeros(input_size, num_experts), requires_grad=True)
-        self.w_noise = nn.Parameter(torch.zeros(input_size, num_experts), requires_grad=True)
-        self.softplus = nn.Softplus()
-        self.softmax = nn.Softmax(dim=1)
+    def forward(self, x):
+        B, L, D = x.shape
+        tokens = x.reshape(-1, D)                                      # [B*L, D]
+        top_idx, top_gates, aux_loss = self.router(tokens)
+        self.last_top_idx = top_idx.detach()
 
-        assert self.k <= self.num_experts
+        out = torch.zeros_like(tokens)
+        for e, expert in enumerate(self.experts):
+            token_idx, slot = (top_idx == e).nonzero(as_tuple=True)   # tokens que eligieron al experto e
+            if token_idx.numel() == 0:
+                continue
+            y = expert(tokens[token_idx]) * top_gates[token_idx, slot].unsqueeze(-1)
+            out.index_add_(0, token_idx, y)
+        return out.reshape(B, L, D), aux_loss
 
-    def cv_squared(self, x):
-        eps = 1e-10
-        if x.shape[0] == 1:
-            return torch.tensor([0.0], device=x.device, dtype=x.dtype)
-        return x.float().var() / (x.float().mean().pow(2) + eps)
 
-    def _gates_to_load(self, gates):
-        return (gates > 0).sum(dim=0)
+class DenseFFN(nn.Module):
 
-    def noisy_top_k_gating(self, x, train, noise_epsilon=1e-2):
-        clean_logits = x @ self.w_gate
-        if self.noisy_gating and train:
-            raw_noise_stddev = x @ self.w_noise
-            noise_stddev = self.softplus(raw_noise_stddev) + noise_epsilon
-            noisy_logits = clean_logits + torch.randn_like(clean_logits) * noise_stddev
-            logits = noisy_logits
-        else:
-            logits = clean_logits
+    def __init__(self, dim, hidden):
+        super().__init__()
+        self.net = Expert(dim, hidden)
 
-        logits = self.softmax(logits)
-        top_logits, top_indices = logits.topk(min(self.k, self.num_experts), dim=1)
-        top_k_gates = top_logits / (top_logits.sum(dim=1, keepdim=True) + 1e-6)
+    def forward(self, x):
+        return self.net(x), x.new_zeros(())
 
-        zeros = torch.zeros_like(logits)
-        gates = zeros.scatter(1, top_indices, top_k_gates)
-        load = self._gates_to_load(gates)
-        return gates, load
 
-    def forward(self, x, loss_coef=1e-2):
-        gates, load = self.noisy_top_k_gating(x, self.training)
-        importance = gates.sum(dim=0)
-        aux_loss = self.cv_squared(importance) + self.cv_squared(load)
-        aux_loss *= loss_coef
+class TransformerBlock(nn.Module):
 
-        dispatcher = SparseDispatcher(self.num_experts, gates)
-        expert_inputs = dispatcher.dispatch(x)
-        expert_outputs = [self.experts[i](expert_inputs[i]) for i in range(self.num_experts)]
-        y = dispatcher.combine(expert_outputs)
-        return y, aux_loss
+    def __init__(self, dim, n_heads, ffn, dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, n_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = ffn
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        h = self.norm1(x)
+        attn_out, _ = self.attn(h, h, h, need_weights=False)
+        x = x + self.drop(attn_out)
+        ffn_out, aux = self.ffn(self.norm2(x))
+        x = x + self.drop(ffn_out)
+        return x, aux
+
+
+class VisionMoE(nn.Module):
+
+    def __init__(self, img_size=32, patch_size=4, in_chans=3, num_classes=10,
+                 dim=128, depth=6, n_heads=4, use_moe=True,
+                 num_experts=8, k=2, expert_hidden=256, dropout=0.1, noisy=True):
+        super().__init__()
+        n_patches = (img_size // patch_size) ** 2
+        # Conv con kernel=stride=patch  ==  cortar en patches + capa lineal sobre cada patch
+        self.patch_embed = nn.Conv2d(in_chans, dim, kernel_size=patch_size, stride=patch_size)
+        self.pos_embed = nn.Parameter(torch.zeros(1, n_patches, dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        self.drop = nn.Dropout(dropout)
+
+        def make_ffn():
+            if use_moe:
+                return MoE(dim, expert_hidden, num_experts, k, noisy)
+            return DenseFFN(dim, expert_hidden * k)
+
+        self.blocks = nn.ModuleList([TransformerBlock(dim, n_heads, make_ffn(), dropout) for _ in range(depth)])
+        self.norm = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, num_classes)
+
+    def forward(self, x):
+        x = self.patch_embed(x).flatten(2).transpose(1, 2)            # [B, 64, dim]
+        x = self.drop(x + self.pos_embed)
+        aux_total = 0.0
+        for block in self.blocks:
+            x, aux = block(x)
+            aux_total = aux_total + aux
+        logits = self.head(self.norm(x).mean(dim=1))
+        return logits, aux_total / len(self.blocks)
+
+
+def count_params(model):
+    """(parámetros totales, parámetros activos por token). En MoE solo k de E expertos trabajan por token."""
+    total = sum(p.numel() for p in model.parameters())
+    inactive = 0
+    for m in model.modules():
+        if isinstance(m, MoE):
+            per_expert = sum(p.numel() for p in m.experts[0].parameters())
+            inactive += per_expert * (m.router.num_experts - m.router.k)
+    return total, total - inactive
